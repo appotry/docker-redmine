@@ -78,6 +78,7 @@ default:
       ca_path: '{{SMTP_CA_PATH}}'
       ca_file: '{{SMTP_CA_FILE}}'
       tls: {{SMTP_TLS}}
+      ssl: {{SMTP_SSL}}
 
   # Absolute path to the directory where attachments are stored.
   # The default is the 'files' directory in your Redmine instance.
@@ -151,11 +152,12 @@ default:
   # scm_stderr_log_file: /var/log/redmine_scm_stderr.log
   scm_stderr_log_file: {{REDMINE_LOG_DIR}}/redmine/redmine_scm_stderr.log
 
-  # Key used to encrypt sensitive data in the database (SCM and LDAP passwords).
+  # Key used to encrypt sensitive data in the database (SCM passwords,
+  # LDAP passwords, and TOTP (two-factor authentication) secret keys).
   # If you don't want to enable data encryption, just leave it blank.
   # WARNING: losing/changing this key will make encrypted data unreadable.
   #
-  # If you want to encrypt existing passwords in your database:
+  # If you want to encrypt existing data in your database:
   # * set the cipher key here in your configuration file
   # * encrypt data using 'rake db:encrypt RAILS_ENV=production'
   #
@@ -164,12 +166,6 @@ default:
   # * change the cipher key here in your configuration file
   # * encrypt data using 'rake db:encrypt RAILS_ENV=production'
   database_cipher_key:
-
-  # Set this to false to disable plugins' assets mirroring on startup.
-  # You can use `rake redmine:plugins:assets` to manually mirror assets
-  # to public/plugin_assets when you install/upgrade a Redmine plugin.
-  #
-  mirror_plugins_assets_on_startup: true
 
   # Your secret key for verifying cookie session data integrity. If you
   # change this key, all old sessions will become invalid! Make sure the
@@ -192,9 +188,13 @@ default:
   # the ImageMagick's `convert` binary. Used to generate attachment thumbnails.
   imagemagick_convert_command: /usr/bin/convert
 
-  # Absolute path (e.g. /usr/bin/gs, c:/ghostscript/gs.exe) to
+  # Absolute path (e.g. /usr/bin/gs, c:/ghostscript/gswin64c.exe) to
   # the `gs` binary. Used to generate attachment thumbnails of PDF files.
   #gs_command:
+
+  # Timeout when generating thumbnails using the `convert` or `gs` command.
+  # Timeout is set in seconds.
+  #thumbnails_generation_timeout: 10
 
   # Configuration of MiniMagick font.
   #
@@ -219,11 +219,6 @@ default:
   # Maximum number of simultaneous AJAX uploads
   max_concurrent_ajax_uploads: {{REDMINE_CONCURRENT_UPLOADS}}
 
-  # Configure OpenIdAuthentication.store
-  #
-  # allowed values: :memory, :file, :memcache
-  #openid_authentication_store: :memory
-
   # URL of the avatar server
   #
   # By default, Redmine uses Gravatar as the avatar server for displaying
@@ -233,8 +228,15 @@ default:
   #
   # URL of each avatar is: #{avatar_server_url}/avatar/#{hash}
   #
-  #avatar_server_url: https://www.gravatar.com        # default
+  avatar_server_url: {{REDMINE_AVATAR_SERVER_URL}}
   #avatar_server_url: https://seccdn.libravatar.org
+
+  # Configure CommonMark hardbreaks behaviour
+  #
+  # allowed values: true, false
+  # true: treats regular line break (\n) as hardbreaks
+  # false: switches to default common mark where two or more spaces are required
+  # common_mark_enable_hardbreaks: true
 
   # Path to store backups (docker-redmine only)
   backup_storage_path: {{REDMINE_BACKUPS_DIR}}

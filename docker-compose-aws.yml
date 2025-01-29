@@ -1,33 +1,14 @@
 services:
-  mysql:
-    image: mysql:8.0-bookworm
-    environment:
-      - MYSQL_USER=redmine
-      - MYSQL_PASSWORD=password
-      - MYSQL_DATABASE=redmine_production
-      - MYSQL_RANDOM_ROOT_PASSWORD=yes
-    volumes:
-      - /srv/docker/redmine/mysql:/var/lib/mysql
-    # https://www.redmine.org/projects/redmine/wiki/MySQL_configuration
-    command: --transaction-isolation=READ-COMMITTED
-    cap_add:
-      - SYS_NICE  # CAP_SYS_NICE
-
   redmine:
     build: ./
-    image: sameersbn/redmine:6.0.3
-    depends_on:
-      - mysql
+    image: sameersbn/redmine:6.0.1
     environment:
-      - TZ=Asia/Kolkata
-
-      - DB_ADAPTER=mysql2
-      - DB_ENCODING=utf8mb4
-      - DB_HOST=mysql
-      - DB_PORT=3306
-      - DB_USER=redmine
-      - DB_PASS=password
-      - DB_NAME=redmine_production
+      - TZ=America/Sao_Paulo
+      - AWS_DB_CREDENTIALS_SECRET_REGION=
+      - AWS_DB_CREDENTIALS_SECRET_NAME=
+      - DB_NAME=redmine
+      - DB_SSL_MODE=prefer
+      - DB_CREATE=false
 
       - REDMINE_PORT=10083
       - REDMINE_HTTPS=false
@@ -64,5 +45,5 @@ services:
     ports:
       - "10083:80"
     volumes:
-      - /srv/docker/redmine/redmine_mysql:/home/redmine/data
+      - /srv/docker/redmine/redmine:/home/redmine/data
       - /srv/docker/redmine/redmine-logs:/var/log/redmine
