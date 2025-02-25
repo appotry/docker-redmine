@@ -3,6 +3,9 @@
 # DEBUGGING
 DEBUG=${DEBUG:-}
 
+# LOGGER
+LOGGER_LEVEL=${LOGGER_LEVEL:-info}
+
 ## CORE
 REDMINE_ATTACHMENTS_DIR=${REDMINE_ATTACHMENTS_DIR:-$REDMINE_DATA_DIR/files}
 REDMINE_PLUGINS_DIR=${REDMINE_PLUGINS_DIR:-$REDMINE_DATA_DIR/plugins}
@@ -53,6 +56,7 @@ DB_PASS=${DB_PASS:-}
 DB_POOL=${DB_POOL:-5}
 DB_SKIP_CHECK=${DB_SKIP_CHECK:-false}
 DB_SSL_MODE=${DB_SSL_MODE:-}
+DB_CREATE=${DB_CREATE:-true}
 
 # backward compatibility
 case ${DB_TYPE} in
@@ -61,19 +65,13 @@ case ${DB_TYPE} in
   sqlite3) DB_ADAPTER=${DB_ADAPTER:-sqlite3} ;;
 esac
 
-if [[ ! -z "${DB_SSL_MODE}" ]]
-then
-  # Add sslmode or ssl_mode depending on type
-  case ${DB_ADAPTER} in
-    mysql2) DB_SSL_MODE="ssl_mode: ${DB_SSL_MODE}" ;;
-    postgresql) DB_SSL_MODE="sslmode: ${DB_SSL_MODE}" ;;
-    sqlite3) DB_SSL_MODE= ;; # No ssl
-  esac
-fi
-
-## UNICORN
+## UNICORN (deprecated)
 UNICORN_WORKERS=${UNICORN_WORKERS:-2}
 UNICORN_TIMEOUT=${UNICORN_TIMEOUT:-60}
+
+## PUMA
+PUMA_WORKERS=${PUMA_WORKERS:-${UNICORN_WORKERS}}
+# There is no PUMA timeout setting
 
 ## MEMCACHED
 MEMCACHED_HOST=${MEMCACHED_HOST:-}
@@ -96,6 +94,7 @@ SMTP_PASS=${SMTP_PASS:-}
 SMTP_OPENSSL_VERIFY_MODE=${SMTP_OPENSSL_VERIFY_MODE:-}
 SMTP_STARTTLS=${SMTP_STARTTLS:-true}
 SMTP_TLS=${SMTP_TLS:-false}
+SMTP_SSL=${SMTP_SSL:-false}
 SMTP_CA_ENABLED=${SMTP_CA_ENABLED:-false}
 SMTP_CA_PATH=${SMTP_CA_PATH:-$REDMINE_DATA_DIR/certs}
 SMTP_CA_FILE=${SMTP_CA_FILE:-$REDMINE_DATA_DIR/certs/ca.crt}
@@ -150,3 +149,6 @@ fi
 
 ## MINIMAGICK
 REDMINE_MINIMAGICK_FONT_PATH=${REDMINE_MINIMAGICK_FONT_PATH:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}
+
+## AVATAR_SERVER
+REDMINE_AVATAR_SERVER_URL=${REDMINE_AVATAR_SERVER_URL:-https://www.gravatar.com}

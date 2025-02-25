@@ -7,9 +7,9 @@ USERCONF_TEMPLATES_DIR="${REDMINE_DATA_DIR}/config"
 
 REDMINE_CONFIG="${REDMINE_INSTALL_DIR}/config/configuration.yml"
 REDMINE_DATABASE_CONFIG="${REDMINE_INSTALL_DIR}/config/database.yml"
-REDMINE_UNICORN_CONFIG="${REDMINE_INSTALL_DIR}/config/unicorn.rb"
+REDMINE_PUMA_CONFIG="${REDMINE_INSTALL_DIR}/config/puma.rb"
 REDMINE_SECRET_CONFIG="${REDMINE_INSTALL_DIR}/config/initializers/secret_token.rb"
-REDMINE_MEMCACHED_CONFIG="${REDMINE_INSTALL_DIR}/config/additional_environment.rb"
+REDMINE_ADDITIONAL_CONFIG="${REDMINE_INSTALL_DIR}/config/additional_environment.rb"
 REDMINE_NGINX_CONFIG="/etc/nginx/sites-enabled/redmine"
 
 IMAGE_VERSION=$(cat /VERSION)
@@ -104,10 +104,50 @@ update_template() {
 }
 
 redmine_finalize_database_parameters() {
+  if [[ -n ${AWS_DB_CREDENTIALS_SECRET_NAME} ]]; then
+    # Set the region, prioritizing a specific value if available
+    local REGION=${AWS_DB_CREDENTIALS_SECRET_REGION:-${AWS_REGION}}
+
+    echo "Installing aws-secrets-manager Ruby gem..."
+    gem install aws-secrets-manager --no-document --silent
+
+    echo "Fetching credentials from AWS Secrets Manager using get_aws_secret.rb..."
+    local SECRET_STRING=$(ruby ${REDMINE_RUNTIME_ASSETS_DIR}/get_aws_secret.rb $AWS_DB_CREDENTIALS_SECRET_NAME $REGION)
+
+    # Check if the command was successful
+    if [[ $? -ne 0 || -z "${SECRET_STRING}" ]]; then
+      echo "Failed to retrieve credentials from Secrets Manager. Please ensure that permissions and settings are correctly configured."
+      return 1
+    fi
+
+    # Parse the JSON from the SecretString
+    echo "Parsing received credentials..."
+    DB_USER=$(echo "${SECRET_STRING}" | jq -r '.username')
+    DB_PASS=$(echo "${SECRET_STRING}" | jq -r '.password')
+    DB_ADAPTER=$(echo "${SECRET_STRING}" | jq -r '.engine')
+    DB_HOST=$(echo "${SECRET_STRING}" | jq -r '.host')
+    DB_PORT=$(echo "${SECRET_STRING}" | jq -r '.port')
+
+    # Set default encoding and adapter based on the engine
+    case ${DB_ADAPTER} in
+      postgres | postgresql)
+        DB_ADAPTER=postgresql
+        DB_ENCODING=${DB_ENCODING:-unicode}
+        ;;
+      mysql | mysql2)
+        DB_ADAPTER=mysql2
+        DB_ENCODING=${DB_ENCODING:-utf8}
+        ;;
+      *)
+        echo "Error: Unsupported engine '${DB_ADAPTER}'. Only 'postgresql' and 'mysql2' are accepted. Aborting..."
+        return 1
+        ;;
+    esac
+
   # is a mysql or postgresql database linked?
   # requires that the mysql or postgresql containers have exposed
   # port 3306 and 5432 respectively.
-  if [[ -n ${MYSQL_PORT_3306_TCP_ADDR} ]]; then
+  elif [[ -n ${MYSQL_PORT_3306_TCP_ADDR} ]]; then
     DB_ADAPTER=${DB_ADAPTER:-mysql2}
     DB_HOST=${DB_HOST:-mysql}
     DB_PORT=${DB_PORT:-${MYSQL_PORT_3306_TCP_PORT}}
@@ -149,6 +189,44 @@ redmine_finalize_database_parameters() {
     DB_USER=${DB_USER:-${POSTGRESQL_ENV_USER}}
     DB_PASS=${DB_PASS:-${POSTGRESQL_ENV_PASS}}
     DB_NAME=${DB_NAME:-${POSTGRESQL_ENV_DB}}
+  elif [[ -n ${DATABASE_URL} ]]; then
+    # Examples of DATABASE_URL:
+    #
+    # From https://guides.rubyonrails.org/v8.0/configuring.html
+    # postgresql://localhost/my_database
+    # postgresql://localhost/blog_development?pool=5
+    # sqlite3:NOT_my_database
+    #
+    # From https://github.com/rails/rails/blob/69b6bc51493a18e8a937d6b5577070f44138e5c1/railties/lib/rails/generators/rails/app/templates/config/databases/mysql.yml.tt#L42
+    # mysql2://myuser:mypass@localhost/somedatabase
+    #
+    # From https://github.com/dokku/dokku-postgres
+    # postgres://lollipop:SOME_PASSWORD@dokku-postgres-lollipop:5432/lollipop
+    #
+    # From https://github.com/dokku/dokku-mysql
+    # mysql://mysql:SOME_PASSWORD@dokku-mysql-lollipop:3306/lollipop
+    #
+    case $(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).scheme') in
+      postgres | postgresql)
+        DB_ADAPTER=${DB_ADAPTER:-postgresql}
+        DB_HOST=${DB_HOST:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).hostname')}
+        DB_PORT=${DB_PORT:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).port || 5432')}
+        DB_USER=${DB_USER:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).user')}
+        DB_PASS=${DB_PASS:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).password')}
+        DB_NAME=${DB_NAME:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).path.delete_prefix("/")')}
+        ;;
+      mysql | mysql2)
+        DB_ADAPTER=${DB_ADAPTER:-mysql2}
+        DB_HOST=${DB_HOST:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).hostname')}
+        DB_PORT=${DB_PORT:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).port || 3306')}
+        DB_USER=${DB_USER:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).user')}
+        DB_PASS=${DB_PASS:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).password')}
+        DB_NAME=${DB_NAME:-$(ruby -r uri -e 'puts URI(ENV["DATABASE_URL"]).path.delete_prefix("/")')}
+        ;;
+      sqlite3)
+        DB_ADAPTER=${DB_ADAPTER:-sqlite3}
+        ;;
+    esac
   fi
 
   if [[ "${DB_ADAPTER}" == sqlite3 ]]; then
@@ -191,6 +269,16 @@ redmine_finalize_database_parameters() {
       ;;
   esac
 
+  if [[ ! -z "${DB_SSL_MODE}" ]]
+  then
+    # Add sslmode or ssl_mode depending on type
+    case ${DB_ADAPTER} in
+      mysql2) DB_SSL_MODE="ssl_mode: ${DB_SSL_MODE}" ;;
+      postgresql) DB_SSL_MODE="sslmode: ${DB_SSL_MODE}" ;;
+      sqlite3) DB_SSL_MODE= ;; # No ssl
+    esac
+  fi
+
   # set default user and database
   DB_USER=${DB_USER:-root}
   DB_NAME=${DB_NAME:-redmine_production}
@@ -231,8 +319,42 @@ redmine_check_database_connection() {
   echo
 }
 
+redmine_check_mysql_database_tx_isolation() {
+  # Print warning if transaction isolation level in mysql is not READ-COMMITTED, which is required to avoid race conditions
+  # https://www.redmine.org/projects/redmine/wiki/MySQL_configuration
+  if [[ ${DB_ADAPTER} == mysql2 ]]; then
+    echo -n "Checking transaction isolation level... "
+    mysql_cmd="mysql \
+          --host "${DB_HOST}" --port "${DB_PORT}" \
+          --user "${DB_USER}" --default-character-set "${DB_ENCODING}" \
+          --skip-column-names \
+          --silent "
+    if ! isolation_lvl=$( MYSQL_PWD="${DB_PASS}" $mysql_cmd \
+          --execute="SELECT @@GLOBAL.tx_isolation;" 2> /dev/null )
+    then
+      # try the new name of the variable, mysql 8+
+      if ! isolation_lvl=$( MYSQL_PWD="${DB_PASS}" $mysql_cmd \
+            --execute="SELECT @@GLOBAL.transaction_isolation;" )
+      then
+        echo
+        echo "ERROR: Failed to check transaction isolation level" >&2
+        return 1
+      fi
+    fi
+
+    echo "$isolation_lvl"
+
+    if [[ ${isolation_lvl} != "READ-COMMITTED" ]]
+    then
+      echo "WARNING: transaction isolation level is not READ-COMMITTED" >&2
+      echo "WARNING: Read more about this issue at:" >&2
+      echo "https://www.redmine.org/projects/redmine/wiki/MySQL_configuration" >&2
+    fi
+  fi
+}
+
 redmine_configure_database() {
-  echo -n "Configuring redmine::database"
+  echo "Configuring redmine::database"
 
   redmine_finalize_database_parameters
   redmine_check_database_connection
@@ -251,6 +373,8 @@ redmine_configure_database() {
   if [[ ${DB_ADAPTER} != mysql2 ]]; then
     exec_as_redmine sed -i "/reconnect: /d" ${REDMINE_DATABASE_CONFIG}
   fi
+
+  redmine_check_mysql_database_tx_isolation
 }
 
 redmine_finalize_memcached_parameters() {
@@ -273,30 +397,31 @@ redmine_configure_memcached() {
 
   if [[ ${MEMCACHE_ENABLED} == true ]]; then
     echo "Configuring redmine::memcached..."
-    install_template ${REDMINE_USER}: redmine/additional_environment.rb ${REDMINE_MEMCACHED_CONFIG} 0644
-    update_template ${REDMINE_MEMCACHED_CONFIG} \
-      MEMCACHE_HOST \
-      MEMCACHE_PORT
+    {
+      echo "config.gem 'dalli'"
+      echo "config.action_controller.perform_caching  = true"
+      echo "config.cache_classes = true"
+      echo "config.cache_store = :mem_cache_store, \"${MEMCACHE_HOST}:${MEMCACHE_PORT}\""
+    } >> "${REDMINE_ADDITIONAL_CONFIG}"
   fi
 }
 
-redmine_configure_unicorn() {
-  echo "Configuring redmine::unicorn..."
+redmine_configure_logger() {
+  echo "Configuring redmine::logger..."
+  echo "config.log_level = :${LOGGER_LEVEL}" >> "${REDMINE_ADDITIONAL_CONFIG}"
+}
+
+redmine_configure_puma() {
+  echo "Configuring redmine::puma..."
   if [[ ${REDMINE_RELATIVE_URL_ROOT} == / ]]; then
-    exec_as_redmine sed -i '/{{REDMINE_RELATIVE_URL_ROOT}}/d' ${REDMINE_UNICORN_CONFIG}
+    exec_as_redmine sed -i '/{{REDMINE_RELATIVE_URL_ROOT}}/d' ${REDMINE_PUMA_CONFIG}
   fi
 
-  if [[ ${NGINX_ENABLED} != true ]]; then
-    # nginx has been disabled, configure unicorn to listen on all interfaces
-    exec_as_redmine sed -i "s|127.0.0.1:8080|0.0.0.0:8080|" ${REDMINE_UNICORN_CONFIG}
-  fi
-
-  update_template ${REDMINE_UNICORN_CONFIG} \
+  update_template ${REDMINE_PUMA_CONFIG} \
     REDMINE_INSTALL_DIR \
     REDMINE_USER \
     REDMINE_RELATIVE_URL_ROOT \
-    UNICORN_WORKERS \
-    UNICORN_TIMEOUT
+    PUMA_WORKERS
 }
 
 redmine_configure_secret_token() {
@@ -345,11 +470,16 @@ redmine_configure_email_delivery() {
       -e "/{{SMTP_OPENSSL_VERIFY_MODE}}/d" \
       -e "/{{SMTP_STARTTLS}}/d" \
       -e "/{{SMTP_TLS}}/d" \
+      -e "/{{SMTP_SSL}}/d" \
       -e "/{{SMTP_CA_PATH}}/d" \
       -e "/{{SMTP_CA_FILE}}/d" \
       ${REDMINE_CONFIG}
   else
     echo "Configuring redmine::email_delivery..."
+
+    if [[ "${SMTP_SSL}" != "true" ]]; then
+      exec_as_redmine sed -i -e '/{{SMTP_SSL}}/d' ${REDMINE_CONFIG}
+    fi
 
     if [[ -z "${SMTP_USER}" ]]; then
       exec_as_redmine sed -i \
@@ -380,7 +510,8 @@ redmine_configure_email_delivery() {
       SMTP_AUTHENTICATION \
       SMTP_OPENSSL_VERIFY_MODE \
       SMTP_STARTTLS \
-      SMTP_TLS
+      SMTP_TLS \
+      SMTP_SSL
 
     if [[ ${SMTP_CA_ENABLED} == true ]]; then
       if [[ -d ${SMTP_CA_PATH} ]]; then
@@ -468,7 +599,7 @@ redmine_configure_fetch_commits() {
           2.*)
             echo "@${REDMINE_FETCH_COMMITS} cd ${REDMINE_HOME}/redmine && ./script/rails runner \"Repository.fetch_changesets\" -e ${RAILS_ENV} >> ${REDMINE_LOG_DIR}/redmine/cron_rake.log 2>&1" >>/tmp/cron.${REDMINE_USER}
             ;;
-          3.*|4.*)
+          3.*|4.*|5.*)
             echo "@${REDMINE_FETCH_COMMITS} cd ${REDMINE_HOME}/redmine && ./bin/rails runner \"Repository.fetch_changesets\" -e ${RAILS_ENV} >> ${REDMINE_LOG_DIR}/redmine/cron_rake.log 2>&1" >>/tmp/cron.${REDMINE_USER}
             ;;
           *)
@@ -519,6 +650,12 @@ redmine_configure_minimagick_font() {
   echo "Configuring redmine::rmagic::font..."
   update_template ${REDMINE_CONFIG} \
     REDMINE_MINIMAGICK_FONT_PATH
+}
+
+redmine_configure_avatar_server() {
+  echo "Configuring redmine::avatar::url..."
+  update_template ${REDMINE_CONFIG} \
+    REDMINE_AVATAR_SERVER_URL
 }
 
 backup_dump_database() {
@@ -729,28 +866,6 @@ initialize_logdir() {
 
 initialize_datadir() {
   echo "Initializing datadir..."
-  chmod -R u+rw,go+r ${REDMINE_DATA_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_DATA_DIR}
-
-  # create plugins directory
-  mkdir -p ${REDMINE_PLUGINS_DIR}
-  chmod -R u+rw,go+r ${REDMINE_PLUGINS_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_PLUGINS_DIR}
-
-  # create themes directory
-  mkdir -p ${REDMINE_THEMES_DIR}
-  chmod -R u+rw,go+r ${REDMINE_THEMES_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_THEMES_DIR}
-
-  # create attachments directory
-  mkdir -p ${REDMINE_ATTACHMENTS_DIR}
-  chmod -R u+rw,go+r ${REDMINE_ATTACHMENTS_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_ATTACHMENTS_DIR}
-
-  # create backups directory
-  mkdir -p ${REDMINE_BACKUPS_DIR}
-  chmod -R u+rw,go+r ${REDMINE_BACKUPS_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_BACKUPS_DIR}
 
   if [[ -d /redmine/files ]]; then # deprecated
     echo "WARNING: "
@@ -759,23 +874,27 @@ initialize_datadir() {
     exit 1
   fi
 
-  # create dotfiles directory
-  mkdir -p ${REDMINE_DOTFILES_DIR}
-  chmod -R u+rw,go+r ${REDMINE_DOTFILES_DIR}
-  chown -R ${REDMINE_USER}: ${REDMINE_DOTFILES_DIR}
+  # create relevant folders and/or fix permissions
+  datafolders=(
+    "${REDMINE_DATA_DIR}"
+    "${REDMINE_PLUGINS_DIR}"
+    "${REDMINE_THEMES_DIR}"
+    "${REDMINE_ATTACHMENTS_DIR}"
+    "${REDMINE_BACKUPS_DIR}"
+    "${REDMINE_DOTFILES_DIR}"
+    "${REDMINE_DOTFILES_DIR}/.subversion"
+    "${REDMINE_DATA_DIR}/tmp"
+  )
+  for dir in "${datafolders[@]}"; do
+    mkdir -p "${dir}"
+    find "${dir}" \! -perm -u=wr,go=r -print0 | xargs -0 -r chmod u+rw,go+r
+    find "${dir}" \! -user ${REDMINE_USER} -print0 | xargs -0 -r chown ${REDMINE_USER}:
+  done
 
+  # special permissions for ~/.ssh
   mkdir -p ${REDMINE_DOTFILES_DIR}/.ssh
   chmod -R u+rw,go-rwx ${REDMINE_DOTFILES_DIR}/.ssh
   chown -R ${REDMINE_USER}: ${REDMINE_DOTFILES_DIR}/.ssh
-
-  mkdir -p ${REDMINE_DOTFILES_DIR}/.subversion
-  chmod -R u+rw,go+r ${REDMINE_DOTFILES_DIR}/.subversion
-  chown -R ${REDMINE_USER}: ${REDMINE_DOTFILES_DIR}/.subversion
-
-  # create tmp directory
-  mkdir -p ${REDMINE_DATA_DIR}/tmp
-  chmod -R u+rw,go+r ${REDMINE_DATA_DIR}/tmp
-  chown -R ${REDMINE_USER}: ${REDMINE_DATA_DIR}/tmp
 }
 
 generate_ssh_client_keys() {
@@ -802,9 +921,10 @@ symlink_dotfiles() {
 install_configuration_templates() {
   echo "Installing configuration templates..."
 
+  install_template ${REDMINE_USER}: redmine/additional_environment.rb ${REDMINE_ADDITIONAL_CONFIG} 0644
   install_template ${REDMINE_USER}: redmine/configuration.yml ${REDMINE_CONFIG} 0640
   install_template ${REDMINE_USER}: redmine/database.yml ${REDMINE_DATABASE_CONFIG} 0640
-  install_template ${REDMINE_USER}: redmine/unicorn.rb ${REDMINE_UNICORN_CONFIG} 0644
+  install_template ${REDMINE_USER}: redmine/puma.rb ${REDMINE_PUMA_CONFIG} 0644
   install_template ${REDMINE_USER}: redmine/secret_token.rb ${REDMINE_SECRET_CONFIG} 0644
 
   if [[ ${REDMINE_RELATIVE_URL_ROOT} != / ]]; then
@@ -842,7 +962,8 @@ configure_redmine() {
 
   redmine_configure_database
   redmine_configure_memcached
-  redmine_configure_unicorn
+  redmine_configure_logger
+  redmine_configure_puma
   redmine_configure_secret_token
   redmine_configure_concurrent_uploads
   redmine_configure_sudo_mode
@@ -853,6 +974,7 @@ configure_redmine() {
   redmine_configure_fetch_commits
   redmine_configure_backups
   redmine_configure_minimagick_font
+  redmine_configure_avatar_server
 
   # configure secure-cookie if using SSL/TLS
   if [[ ${REDMINE_HTTPS} == true ]]; then
@@ -988,8 +1110,21 @@ migrate_database() {
   CACHE_VERSION=
   [[ -f ${REDMINE_DATA_DIR}/tmp/VERSION ]] && CACHE_VERSION=$(cat ${REDMINE_DATA_DIR}/tmp/VERSION)
   if [[ ${REDMINE_VERSION} != ${CACHE_VERSION} ]]; then
+    if [[ "${DB_CREATE}" == "true" ]] ; then
+      echo "Creating database..."
+      if ! exec_as_redmine bundle exec rake db:create >/dev/null
+      then
+        cat <<-EOM
+Failed to create db. If db exists, and user (or role) exists and has access to db but no permission to create databases, set:
+-----------------------
+DB_CREATE=false
+-----------------------
+EOM
+        return 1
+      fi
+    fi
+
     echo "Migrating database. Please be patient, this could take a while..."
-    exec_as_redmine bundle exec rake db:create >/dev/null
     exec_as_redmine bundle exec rake db:migrate >/dev/null
 
     # clear sessions and application cache
@@ -998,6 +1133,7 @@ migrate_database() {
 
     # Now that database has been migrated, update version file
     echo ${REDMINE_VERSION} | exec_as_redmine tee --append ${REDMINE_DATA_DIR}/tmp/VERSION >/dev/null
+    export REDMINE_WAS_UPDATED=yes
   fi
 }
 
@@ -1054,7 +1190,7 @@ install_plugins() {
 install_themes() {
   if [[ -d ${REDMINE_THEMES_DIR} ]]; then
     echo "Installing themes..."
-    rsync -avq --chown=${REDMINE_USER}:${REDMINE_USER} ${REDMINE_THEMES_DIR}/ ${REDMINE_INSTALL_DIR}/public/themes/
+    rsync -avq --chown=${REDMINE_USER}:${REDMINE_USER} ${REDMINE_THEMES_DIR}/ ${REDMINE_INSTALL_DIR}/themes/
   fi
 }
 

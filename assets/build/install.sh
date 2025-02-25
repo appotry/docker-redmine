@@ -3,9 +3,9 @@ set -e
 
 GEM_CACHE_DIR="${REDMINE_BUILD_ASSETS_DIR}/cache"
 
-BUILD_DEPENDENCIES="wget libcurl4-openssl-dev libssl-dev libmagickcore-dev libmagickwand-dev \
-                    libmysqlclient-dev libpq-dev libxslt1-dev libffi-dev libyaml-dev \
-                    libsqlite3-dev"
+BUILD_DEPENDENCIES="curl libcurl4-openssl-dev libssl-dev libmagickcore-dev libmagickwand-dev \
+                    libpq-dev libxslt1-dev libffi-dev libyaml-dev \
+                    "
 
 ## Execute a command as REDMINE_USER
 exec_as_redmine() {
@@ -14,6 +14,7 @@ exec_as_redmine() {
 
 # install build dependencies
 apt-get update
+apt-mark manual '.*' # Mark all packages installed manually so they are not removed when build dependencies are removed
 DEBIAN_FRONTEND=noninteractive apt-get install -y ${BUILD_DEPENDENCIES}
 
 # add ${REDMINE_USER} user
@@ -21,12 +22,15 @@ adduser --disabled-login --gecos 'Redmine' ${REDMINE_USER}
 passwd -d ${REDMINE_USER}
 
 # set PATH for ${REDMINE_USER} cron jobs
+# Set GEM_HOME and BUNDLE_APP_CONFIG for ${REDMINE_USER}, needed for ruby:3.2-slim-bookworm image
 cat > /tmp/cron.${REDMINE_USER} <<EOF
 REDMINE_USER=${REDMINE_USER}
 REDMINE_INSTALL_DIR=${REDMINE_INSTALL_DIR}
 REDMINE_DATA_DIR=${REDMINE_DATA_DIR}
 REDMINE_RUNTIME_ASSETS_DIR=${REDMINE_RUNTIME_ASSETS_DIR}
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+BUNDLE_APP_CONFIG=/usr/local/bundle
+GEM_HOME=/usr/local/bundle
 EOF
 crontab -u ${REDMINE_USER} /tmp/cron.${REDMINE_USER}
 rm -rf /tmp/cron.${REDMINE_USER}
@@ -37,7 +41,7 @@ if [[ -f ${REDMINE_BUILD_ASSETS_DIR}/redmine-${REDMINE_VERSION}.tar.gz ]]; then
   exec_as_redmine tar -zvxf ${REDMINE_BUILD_ASSETS_DIR}/redmine-${REDMINE_VERSION}.tar.gz --strip=1 -C ${REDMINE_INSTALL_DIR}
 else
   echo "Downloading Redmine ${REDMINE_VERSION}..."
-  exec_as_redmine wget "http://www.redmine.org/releases/redmine-${REDMINE_VERSION}.tar.gz" -O /tmp/redmine-${REDMINE_VERSION}.tar.gz
+  exec_as_redmine curl -fL "http://www.redmine.org/releases/redmine-${REDMINE_VERSION}.tar.gz" -o /tmp/redmine-${REDMINE_VERSION}.tar.gz
 
   echo "Extracting..."
   exec_as_redmine tar -zxf /tmp/redmine-${REDMINE_VERSION}.tar.gz --strip=1 -C ${REDMINE_INSTALL_DIR}
@@ -48,38 +52,46 @@ fi
 # HACK: we want both the pg and mysql2 gems installed, so we remove the
 #       respective lines and add them at the end of the Gemfile so that they
 #       are both installed.
-PG_GEM=$(grep 'gem "pg"' ${REDMINE_INSTALL_DIR}/Gemfile | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
-MYSQL2_GEM=$(grep 'gem "mysql2"' ${REDMINE_INSTALL_DIR}/Gemfile | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
+PG_GEM=$(grep 'gem .pg.' ${REDMINE_INSTALL_DIR}/Gemfile | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
+MYSQL2_GEM=$(grep 'gem .mysql2.' ${REDMINE_INSTALL_DIR}/Gemfile | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
 # SQLITE line spans 2 lines until after this commit: https://github.com/redmine/redmine/commit/dc05c52e5a25b43c49246a952607551bf0d96f29#diff-8b7db4d5cc4b8f6dc8feb7030baa2478
 # The 2 lines one has RUBY_VERSION in it
-SQLITE3_2LINES_GEM=$(grep -A1 -e 'gem "sqlite3".*RUBY_VERSION' "${REDMINE_INSTALL_DIR}/Gemfile" | awk '{gsub(/^[ \t ]+|[ \t ]+$/,    ""); print;}')
-SQLITE3_GEM=$(grep 'gem "sqlite3"' "${REDMINE_INSTALL_DIR}/Gemfile" | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
+SQLITE3_2LINES_GEM=$(grep -A1 -e 'gem .sqlite3..*RUBY_VERSION' "${REDMINE_INSTALL_DIR}/Gemfile" | awk '{gsub(/^[ \t ]+|[ \t ]+$/,    ""); print;}')
+SQLITE3_GEM=$(grep 'gem .sqlite3.' "${REDMINE_INSTALL_DIR}/Gemfile" | awk '{gsub(/^[ \t]+|[ \t]+$/,""); print;}')
+
+[ -z "$PG_GEM" ] && (echo "Error couldn't find gem pg, update instal.sh"; exit 1)
+[ -z "$MYSQL2_GEM" ] && (echo "Error couldn't find gem mysql2, update instal.sh"; exit 1)
+[ -z "$SQLITE3_GEM" ] && (echo "Error couldn't find gem sqlite3, update instal.sh"; exit 1)
 
 sed -i \
-  -e '/gem "pg"/d' \
-  -e '/gem "mysql2"/d' \
+  -e '/gem .pg./d' \
+  -e '/gem .mysql2./d' \
   ${REDMINE_INSTALL_DIR}/Gemfile
 
 if [ -z "$SQLITE3_2LINES_GEM" ]
 then
   sed -i \
-    -e '/gem "sqlite3"/d' \
+    -e '/gem .sqlite3./d' \
     "${REDMINE_INSTALL_DIR}/Gemfile"
 else
   # Delete 2 lines
   sed -i \
-    -e '/gem "sqlite3"/ { N; d; }' \
+    -e '/gem .sqlite3./ { N; d; }' \
     "${REDMINE_INSTALL_DIR}/Gemfile"
   SQLITE3_GEM=${SQLITE3_2LINES_GEM}
 fi
+
+# Delete test: puma
+sed -i \
+  -e '/gem .puma./d' \
+  "${REDMINE_INSTALL_DIR}/Gemfile"
 
 (
   echo "${PG_GEM}";
   echo "${MYSQL2_GEM}";
   echo "${SQLITE3_GEM}";
-  echo '# unicorn 5.5.0 has a bug in unicorn_rails. See issue #392';
-  echo 'gem "unicorn", "~> 5.4", "!=5.5.0"';
-  echo 'gem "dalli", "~> 2.7.0"';
+  echo 'gem "puma", "~> 6"';
+  echo 'gem "dalli", "~> 3.2.6"';
 ) >> ${REDMINE_INSTALL_DIR}/Gemfile
 
 ## some gems complain about missing database.yml, shut them up!
@@ -186,13 +198,13 @@ stdout_logfile=${REDMINE_LOG_DIR}/supervisor/%(program_name)s.log
 stderr_logfile=${REDMINE_LOG_DIR}/supervisor/%(program_name)s.log
 EOF
 
-# configure supervisord to start unicorn
-cat > /etc/supervisor/conf.d/unicorn.conf <<EOF
-[program:unicorn]
+# configure supervisord to start puma
+cat > /etc/supervisor/conf.d/puma.conf <<EOF
+[program:puma]
 priority=10
 directory=${REDMINE_INSTALL_DIR}
 environment=HOME=${REDMINE_HOME}
-command=bundle exec unicorn_rails -E ${RAILS_ENV} -c ${REDMINE_INSTALL_DIR}/config/unicorn.rb
+command=bundle exec puma -e ${RAILS_ENV} -C ${REDMINE_INSTALL_DIR}/config/puma.rb
 user=${REDMINE_USER}
 autostart=true
 autorestart=true
